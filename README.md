@@ -1,2 +1,88 @@
-# embedded-smart-car
-A smart car project for Southeast University's embedded systems summer course, combining OpenCV line following, YOLOX traffic sign recognition, and state machine control for complex tracks. Validated on real hardware.
+# 智能小车综合赛道：循迹 + 交通标志识别 融合版
+
+在 **04-循迹**（LineDetector + PD + 失线保护 + 直角弯三段式）与 **05-标志识别**（YOLOX 11 类 ONNX）基础上融合：
+
+- 主线程 ~20Hz 逐帧循迹（CPU 开销小）；**YOLOX 检测放后台线程**（416² 推理 50~300ms，不阻塞控制环，结果按帧序号去重）。
+- 仲裁器 Arbiter 统一决策，优先级：**红灯抢占 > 红灯等待 > 动作执行 > 任务记忆（接近减速）> 循迹**。
+- 转向/掉头/变道任务**先记忆、到执行区再动作**：用循迹的横条检测（corner/cross 的 `nearness≥0.6`）作"到达执行区"触发，替代纯计时；超过 4s 未触发自动丢弃。
+- 左/右转执行复用循迹的**三段式直角转弯**（固定角速度 → PD 辅助回正 → 超时停车），转完真正重新捕获线路。
+- 限速为持续状态直到解除；人行横道确认后低速通过 3 秒（本轮规则）；动作完成 4s 冷却防重复；红灯永不受冷却屏蔽。
+- 动作结束后自动**重新起步确认 + 速度斜坡**，避免猛冲。
+
+## 方向约定
+
+`x>0 前进；y>0 左移；逻辑 z>0 = 左转`（与 04/05 实验可执行代码一致）。
+架空车轮实测若整车转向相反，加 `--z-flip` 整体取反（预期不需要）。
+
+## 快速开始（在车上 Linux 板运行）
+
+```bash
+python run.py                    # 正常运行（自动找摄像头/串口）
+python run.py --debug            # 融合调试窗口（循迹overlay+检测框+状态）
+python run.py --no-drive --debug # 台架验证：只打印指令不驱动车轮
+python self_check.py             # 无车离线断言（无需任何硬件/依赖）
+```
+
+## 本轮规则对应的参数
+
+| 规则 | 参数（默认值） |
+|---|---|
+| 人行横道低速通过 | `--crosswalk-speed 100 --crosswalk-sec 3.0` |
+| 十字路口变道（写死动作链，不等横条） | **必须先确认过掉头标志**才允许十字路口任务，避免其他标志误识别成十字路口而误平移；解锁后确认十字路口→循迹 `--lc-delay 3.0`s→纯横向平移，`--lc-max-sec 8.0` 兜底 |
+| 大环岛（写死动作链，横条触发） | 环岛标志使用独立阈值 `--roundabout-confidence 0.80`，低于80%的结果不参与确认且不会触发动作。任务最长记忆 `--rb-memory-hold 40.0`s；入口左转进环后，路口横条需连续 `--rb-junc-confirm-frames 3` 帧才确认。第1路口从候选确认帧起固定输出右转（默认 `x=100,z=-160`），至少持续 `--rb-first-right-min-sec 0.8`s；横条消失且主线连续稳定 `--rb-first-line-frames 4` 帧后才恢复循迹。连续右转超过 `--rb-first-right-max-sec 4.0`s 会停车等线，不会把控制权交回可能向左误转的循迹拟合。计数后仍须连续无横条 `--rb-junc-clear-frames 10` 帧且间隔至少 `--rb-junc-min-gap-sec 3.0`s 才能识别第2路口；整个动作由 `--rb-max-sec 60.0` 兜底 |
+| 掉头标志置信度 | 独立阈值 `--uturn-confidence 0.75`；低于75%的掉头结果不参与确认、不执行掉头，也不会解锁后续十字路口平移动作 |
+| 左右转标志置信度 | 左转、右转共用独立阈值 `--turn-confidence 0.75`；低于75%的结果不参与确认、不记忆转向任务，也不会在后续路口执行转弯 |
+| Y 形岔口无条件选路 | `--fork-side left`（沿原方向；`right`=新岔路，`none`=关闭） |
+| 反Y 汇合口 | 自动判别（段间距趋势：远处张开=分岔锁边，远处收拢=汇合守当前线），无需参数 |
+| 右开口 Y（左岔长线贯通+右侧直角横条） | 自动处理：横向岔条造成的超宽拟合点被剔除，车沿贯通的左岔平滑进入；这种岔口的横条判 cross 但 sym=False，不会触发变道/误动作 |
+| 掉头（写死动作链，不等横条） | 确认掉头标志 `--uturn-delay 2.0`s 后原地旋转 360°（`--uturn-sec 7.2`，默认顺时针 `--uturn-right`）→ 闭环循迹 `--uturn-follow-sec 4.5`s → 三段式右转 → 回循迹；`--uturn-follow-sec 0` 取消后续右转 |
+| 相切环岛一次性右入 | 正常处理满 `--cone-total 2` 个锥桶；若进度停在 1/2 达 `--cone-missing-timeout-sec 20.0` 秒，则兜底视为 2/2。从正常完成或兜底补全时刻起，连续 `--fork-right-cone-clear-sec 20.0` 秒未再识别到锥桶，才启用入口识别。反Y和正Y各自必须连续 `--fork-right-confirm-frames 3` 帧确认；反Y确认后只要在 `--fork-right-window 5.0` 秒内确认正Y即可，没有最小间隔。满足后唯一一次切右入环：保持右侧选线，并在 `--fork-right-sec 3.0` 秒内保证小幅右转；默认 `--fork-right-z 80`，即逻辑角速度至少达到 `z=-80`。之后取消右转、恢复左侧并永久锁存。启用前的反Y不会被记忆；再次看见锥桶会清空序列并重新计算静默时间 |
+| 巡航/限速速度 | `--speed 250 --slow-speed 140`（协议限幅 ±300 内） |
+
+## 上场前调参顺序
+
+1. `python self_check.py` 全 PASS（逻辑验证，Windows 开发机即可）。
+2. `--no-drive --debug` 台架：用打印的标志图/手机图验证"识别→记忆→横条触发→执行"时序。
+3. 架空车轮低速：确认物理 z 方向（原地左转确实是左转，否则加 `--z-flip`）；变道/绕锥 y 方向。
+4. 地面逐项：纯循迹一圈 → 限速+解除 → 红/绿灯 → 左/右转 → 掉头/环岛/变道/绕锥/横道 → 整图联跑。
+
+## 常用调参
+
+| 现象 | 调整 |
+|---|---|
+| 左/右转标志入岔（只在路口触发） | 两线索：① 横条到执行区（nearness≥`--exec-trigger`）② 前向Y岔口 junction=fork 连续2帧——**不设时间兜底盲转**，没看见路口绝不转；任务最长保持 `--turn-hold 20.0`s 等不到路口才丢弃。执行器按线索自动选（`--turn-style auto`）：岔口线索→闭环循线入岔（前向Y在循迹基础上选岔）；横条线索→三段式直角转弯（十字路口到路口正中才转） |
+| 首个转向标志写死右转 | 默认开启：启动后第一次看见的左转/右转标志统一按右转执行（本轮 YOLO 对左/右转区分不准）；之后的转向标志按识别类别。`--no-first-turn-right` 关闭 |
+| 误把支线横条当执行区 | 转向已有三线索冗余（见上行）；环岛/绕锥等其余任务超时丢弃后有 4s 冷却，持续误检的标志不会反复占用 memorized 状态挡住后续标志 |
+| 右开口 Y 处被拽成直行 | 已内置处理：超宽横条行不参与拟合（沿左岔贯通线进入）。注意：变道现在是确认标志后 3s 纯时间触发，若该处误检十字路口标志会真的平移——务必调高 `--confidence`（如 0.4）压住误检 |
+| 直角弯横条远近在 cross/corner 间跳变 | `--cross-min-ext 0.15`（十字判据短边伸出绝对门槛，直角弯肘部不再误判 cross）；标志任务与横条方向矛盾时自动丢弃并交给自动直角弯。转弯固定段严格按标定时长转满 90°，期间斜横条即使被误判 cross/干净线也不会提前触发 PD 回正（15° 早退已根治） |
+| 转向转过头/不足、只转十几度就回正 | 固定旋转段**严格转满标定时长**才允许 PD/退出（期间丢线、斜横条扮"假线"都不会提前回正）：`--corner-turn-sec`（默认 0=自动 900÷`--corner-z`≈90°，与掉头 7.2s·z500=360° 标定同源）——转多了调小、转少了调大；转速用 `--corner-z`（默认 400，越快标定时长自动越短、转角不变）；到点后 PD 捕获新线回正（欠转拉正、过转运回），`--corner-exit-err/angle` 调回正门槛 |
+| 掉头转不够/转过头 | `--uturn-sec 7.2`（原地 360° 的时长，实车标定；360° 自对齐，偏长多转圈但终点朝向不变，偏短才会转不够） |
+| 掉头后右转时机不对 | `--uturn-follow-sec 1.0`（掉头结束到右转之间的循迹时长；转早/转晚都调它） |
+| 直道/弯道速度 | `--speed`、`--kp/--kd/--ka`、`--max-z` |
+| 误识别触发动作 | `--confidence 0.30` 调高、`--confirm-frames 2` 调大 |
+| 岔口误选到右岔/被噪点带偏 | `--fork-min-ratio 0.5` 调大（分支认定更严格） |
+| 过岔后短暂误触发自动转弯 | `--fork-hold-frames 15` 调大（延长横条屏蔽） |
+| 其他标志误识别成十字路口导致平移 | 已加掉头标志锁存：确认掉头前所有十字路口结果都会被忽略 |
+| 大环岛第1路口仍偏左/右转不足 | 调大 `--rb-first-right-z` 或 `--rb-first-right-min-sec`；第1路口会固定右转，只有横条消失且线路误差满足 `--rb-first-line-error`、`--rb-first-line-angle` 并连续稳定若干帧后才恢复循迹 |
+| 大环岛同一路口被计数两次 | 调大 `--rb-junc-confirm-frames`、`--rb-junc-clear-frames` 或 `--rb-junc-min-gap-sec`；默认分别为 3帧、10帧、3秒 |
+| 第二个锥桶漏掉 | `--cone-missing-timeout-sec 20.0`：1/2 保持到时自动补成 2/2；调试栏“右入=等锥Xs”显示剩余时间 |
+| 小环岛右入过早启用 | 调大 `--fork-right-cone-clear-sec`；调试栏显示“右入=等锥Xs/静默Xs/就绪/已用” |
+
+全部参数见 `python run.py --help`。
+
+## 文件说明
+
+```
+run.py                  主程序（主循环 + 检测后台线程 + CLI + 调试窗口）
+self_check.py           无车离线断言
+core/line_follower.py   LineDetector（与04逐字一致）+ FollowerController（step/turn_step）
+core/arbiter.py         仲裁状态机 + 转向/时序执行器
+detection/              YOLOX 11 类检测（来自05，detect_signs 为后台线程轻量接口）
+comm/                   底盘串口协议 + USB 摄像头（与04/05一致）
+resources/model_zoo/    sign11_yolox_nano.onnx
+photos/                 标志标准参考图（调试用）
+```
+
+## 依赖（车上环境，与 05 一致）
+
+`opencv-python numpy onnxruntime(或gpu版) pyserial Pillow`

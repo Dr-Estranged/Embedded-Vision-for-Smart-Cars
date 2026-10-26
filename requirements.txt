@@ -1,0 +1,18 @@
+# 智能车循迹与交通标志识别：Python 依赖
+# 安装方式：python -m pip install -r requirements.txt
+
+# 图像数据处理（import numpy）
+numpy
+
+# 摄像头采集、循迹处理与调试窗口（import cv2）
+# 使用支持窗口显示的版本，以支持 --debug 中的 cv2.imshow。
+opencv-python
+
+# 底盘串口通信（import serial）
+pyserial
+
+# YOLOX ONNX 模型推理（import onnxruntime）
+onnxruntime
+
+# 中文标签与调试文字绘制（from PIL import ...）
+Pillow
